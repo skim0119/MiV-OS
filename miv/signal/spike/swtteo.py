@@ -1,25 +1,4 @@
-__doc__ = """
-
-Code Example::
-
-    detection = ThresholdCutoff(cutoff=3.5)
-    spiketrains = detection(signal, timestamps, sampling_rate)
-
-.. currentmodule:: miv.signal.spike
-
-.. autosummary::
-   :nosignatures:
-   :toctree: _toctree/DetectionAPI
-
-   SpikeDetectionProtocol
-   ThresholdCutoff
-   SWTTEO
-   ExtractWaveforms
-   WaveformAverage
-   WaveformStatisticalFilter
-
-"""
-__all__ = ["ThresholdCutoff", "query_firing_rate_between"]
+__all__ = ["SWTTEO"]
 
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
@@ -48,9 +27,17 @@ from miv.visualization.event import plot_spiketrain_raster
 
 
 @dataclass
-class ThresholdCutoff(OperatorMixin):
-    """ThresholdCutoff
-    Spike sorting step by step guide is well documented `here <http://www.scholarpedia.org/article/Spike_sorting>`_.
+class SWTTEODetection(OperatorMixin):
+    """SWTTEO spike detection
+    This module contains the functions for the spike wavelet transform (SWT) and the spike wavelet transform.
+
+    Code Example::
+
+        detection = ThresholdCutoff(cutoff=5.0)
+        spiketrains = detection(signal, timestamps, sampling_rate)
+
+    [1] Mayer M, Arrizabalaga O, Lieb F, Ciba M, Ritter S, Thielemann C. Electrophysiological investigation of human embryonic stem cell derived neurospheres using a novel spike detection algorithm. Biosens Bioelectron. 2018 Feb 15;100:462-468. doi: 10.1016/j.bios.2017.09.034. Epub 2017 Sep 19. PMID: 28963963.
+    [2] https://ars.els-cdn.com/content/image/1-s2.0-S0956566317306437-mmc1.pdf
 
         Attributes
         ----------
@@ -315,30 +302,3 @@ class ThresholdCutoff(OperatorMixin):
             plt.show()
 
         return ax
-
-
-def query_firing_rate_between(
-    spikestamps: Spikestamps,
-    min_firing_rate: float,
-    max_firing_rate: float,
-) -> np.ndarray:
-    """
-    Mask channels with firing rates between min_firing_rate and max_firing_rate
-
-    Parameters
-    ----------
-    spikestamps : Spikestamps
-        Spikestamps
-    min_firing_rate : float
-        Minimum firing rate
-    max_firing_rate : float
-        Maximum firing rate
-
-    Returns
-    -------
-    Spikestamps
-        Mask of channels with firing rates between min_firing_rate and max_firing_rate
-    """
-    rates = np.array(firing_rates(spikestamps)["rates"])
-    masks = np.logical_and(rates >= min_firing_rate, rates <= max_firing_rate)
-    return np.where(masks)[0]
