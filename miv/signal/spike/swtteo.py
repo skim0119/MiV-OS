@@ -1,4 +1,4 @@
-__all__ = ["SWTTEO"]
+__all__ = ["SWTTEODetection"]
 
 from typing import Any, Dict, Generator, Iterable, List, Optional, Tuple, Union
 
@@ -12,14 +12,14 @@ import pathlib
 from dataclasses import dataclass
 
 import matplotlib.pyplot as plt
-import neo
 import numpy as np
+import pywt
 import quantities as pq
+import scipy.signal as sps
 from tqdm import tqdm
 
 from miv.core.datatype import Signal, Spikestamps
 from miv.core.operator import OperatorMixin
-from miv.core.policy import InternallyMultiprocessing
 from miv.core.wrapper import wrap_cacher
 from miv.statistics.spiketrain_statistics import firing_rates
 from miv.typing import SignalType, SpikestampsType, TimestampsType
@@ -30,55 +30,51 @@ from miv.visualization.event import plot_spiketrain_raster
 class SWTTEODetection(OperatorMixin):
     """SWTTEO spike detection
     This module contains the functions for the spike wavelet transform (SWT) and the spike wavelet transform.
+    The algorithm is introduced in [1]_ and the application can be found in [2]_ [3]_.
 
     Code Example::
 
+        bandpass = ButterBandpass(lowcut=300, highcut=3000)
+        lowpass = ButterBandpass(highcut=300, btype='lowpass')
         detection = ThresholdCutoff(cutoff=5.0)
+        swtteo = SWTTEODetection()
+        spikestamps_intersection = SpikestampsIntersection()
+
+        data >> bandpass >> detection >> spikestamps_intersection
+        data >> lowpass >> swtteo >> spikestamps_intersection
+        detection >> swtteo
+
         spiketrains = detection(signal, timestamps, sampling_rate)
 
-    [1] Mayer M, Arrizabalaga O, Lieb F, Ciba M, Ritter S, Thielemann C. Electrophysiological investigation of human embryonic stem cell derived neurospheres using a novel spike detection algorithm. Biosens Bioelectron. 2018 Feb 15;100:462-468. doi: 10.1016/j.bios.2017.09.034. Epub 2017 Sep 19. PMID: 28963963.
-    [2] https://ars.els-cdn.com/content/image/1-s2.0-S0956566317306437-mmc1.pdf
+    .. [1] Lieb F, Stark HG, Thielemann C. A stationary wavelet transform and a time-frequency based spike detection algorithm for extracellular recorded data. J Neural Eng. 2017 Jun;14(3):036013. doi: 10.1088/1741-2552/aa654b. Epub 2017 Mar 8. PMID: 28272020.
+    .. [2] Mayer M, Arrizabalaga O, Lieb F, Ciba M, Ritter S, Thielemann C. Electrophysiological investigation of human embryonic stem cell derived neurospheres using a novel spike detection algorithm. Biosens Bioelectron. 2018 Feb 15;100:462-468. doi: 10.1016/j.bios.2017.09.034. Epub 2017 Sep 19. PMID: 28963963.
+    .. [3] https://ars.els-cdn.com/content/image/1-s2.0-S0956566317306437-mmc1.pdf
 
         Attributes
         ----------
-        dead_time : float
-            (default=0.003)
-        search_range : float
-            (default=0.002)
-        cutoff : Union[float, np.ndarray]
-            (default=5.0)
         tag : str
-        units : Union[str, pq.UnitTime]
-            (default='sec')
         progress_bar : bool
             Toggle progress bar (default=True)
-        return_neotype : bool
-            If true, return spiketrains in neo.Spiketrains (default=True)
-            If false, return list of numpy-type spiketrains.
     """
 
-    dead_time: float = 0.003
-    search_range: float = 0.002
-    cutoff: float = 5.0
-    tag: str = "spike detection"
-    progress_bar: bool = False
-    units: str = "sec"
-    return_neotype: bool = False  # TODO: Remove, shift to spikestamps datatype
+    spike_width: float = 0.001  # in seconds
 
-    exclude_channels = None
+    tag: str = "swtteo detection"
+    progress_bar: bool = False
 
     num_proc: int = 1
 
+    hamming_window_size: float = 0.013  # in seconds
+    wavelet_decomposition_level: int = 2
+
     # @wrap_generator_to_generator
-    @wrap_cacher(cache_tag="spikestamps")
-    def __call__(self, signal: SignalType) -> SpikestampsType:
+    @wrap_cacher(cache_tag="swtteo")
+    def __call__(self, signal: SignalType, spikestamps: Spikestamps) -> SpikestampsType:
         """Execute threshold-cutoff method and return spike stamps
 
         Parameters
         ----------
         signal : Signal
-        custom_spike_threshold : np.ndarray
-            If not None, use this value * cutoff as spike threshold.
 
         Returns
         -------
@@ -88,7 +84,10 @@ class SWTTEODetection(OperatorMixin):
         if not inspect.isgenerator(
             signal
         ):  # TODO: Refactor in multiprocessing-enabling decorator
-            return self._detection(signal)
+            s = self.apply_swt_teo(signal)
+            return self._detection(
+                s, spikestamps.get_view(s.get_start_time(), s.get_end_time())
+            )
         else:
             collapsed_result = Spikestamps()
             # with multiprocessing.Pool(self.num_proc) as pool:
@@ -98,131 +97,133 @@ class SWTTEODetection(OperatorMixin):
             #    for result in pool.map(self._detection, inputs): # TODO: Something is not correct here. Check memory usage.
             #        collapsed_result.extend(spiketrain)
             for sig in signal:  # TODO: mp
-                collapsed_result.extend(self._detection(sig))
+                s = self.apply_swt_teo(sig)
+                collapsed_result.extend(
+                    self._detection(
+                        s, spikestamps.get_view(s.get_start_time(), s.get_end_time())
+                    )
+                )
             return collapsed_result
 
+    def apply_swt_teo(self, signal):
+        # Apply SWT level 1 and 2
+        NN = self.wavelet_decomposition_level
+        window_size = int(
+            self.hamming_window_size * signal.rate
+        )  # convert 13ms to window size
+        hamming_window = np.hamming(window_size)
+        hamming_window = hamming_window / np.sqrt(
+            3 * (hamming_window**2).sum() + (hamming_window.sum() ** 2)
+        )  # Normalize
+
+        coeffs = pywt.swt(signal.data, "sym5", level=NN, axis=0)
+
+        streams = []
+        for idx, (cA, _) in enumerate(coeffs):
+            # plt.figure()
+            # plt.plot(cA[:,0], label=f'cA {NN-idx}')
+            output = self._signal_energy_operator(
+                cA, absolute=True
+            )  # Teager Energy Operator
+            # plt.plot(output[:,0], label='energy')
+
+            # Apply Hamming window
+            for ch in range(output.shape[1]):
+                output[:, ch] = np.convolve(output[:, ch], hamming_window, mode="same")
+            # plt.plot(output[:,0], label='after hammin')
+            # plt.legend()
+            # plt.show(block=False)
+
+            streams.append(output)
+
+        data = functools.reduce(np.add, streams) / NN
+        s = Signal(data=data, rate=signal.rate, timestamps=signal.timestamps)
+
+        return s
+
     # @staticmethod
-    def _detection(self, signal: SignalType):
+    def _detection(self, signal: SignalType, spikestamps: Spikestamps):
         # Spike detection for each channel
         spiketrain_list = []
         num_channels = signal.number_of_channels  # type: ignore
         timestamps = signal.timestamps
         rate = signal.rate
+
+        spike_counts = spikestamps.get_count()
         for channel in tqdm(
             range(num_channels), disable=not self.progress_bar, desc=self.tag
         ):
-            if self.exclude_channels is not None and channel in self.exclude_channels:
-                spiketrain_list.append(np.array([]))
+            array = np.asarray(signal[channel])  # type: ignore
+            count = spike_counts[channel]
+            if count == 0:
+                spiketrain_list.append([])
                 continue
-            array = signal[channel]  # type: ignore
 
             # Spike Detection: get spikestamp
-            spike_threshold = self._compute_spike_threshold(array, cutoff=self.cutoff)
-            crossings = self._detect_threshold_crossings(
-                array, rate, spike_threshold, self.dead_time
-            )
-            spikes = self._align_to_minimum(array, rate, crossings, self.search_range)
-            spikestamp = spikes / rate + timestamps.min()
-            # Convert spikestamp to neo.SpikeTrain (for plotting)
-            if self.return_neotype:
-                spiketrain = neo.SpikeTrain(
-                    spikestamp,
-                    units=self.units,  # TODO: make this compatible to other units
-                    t_stop=timestamps.max(),
-                    t_start=timestamps.min(),
-                )
-                spiketrain_list.append(spiketrain)
-            else:
-                spiketrain_list.append(spikestamp.astype(np.float_))
+            spike_width = int(self.spike_width * rate)
+            peaks, _ = sps.find_peaks(array, distance=spike_width)
+            if len(peaks) == 0:
+                spiketrain_list.append([])
+                continue
+            spikestamp = np.sort(timestamps[peaks])
+            # energy_spike_indices = array[peaks].argsort()[-count:]
+            # spikestamp = np.sort(timestamps[peaks][energy_spike_indices])
+
+            spiketrain_list.append(spikestamp)
         spikestamps = Spikestamps(spiketrain_list)
         return spikestamps
 
     def __post_init__(self):
         super().__init__()
 
-    def _compute_spike_threshold(
-        self, signal: SignalType, cutoff: float = 5.0
-    ) -> (
-        float
-    ):  # TODO: make this function compatible to array of cutoffs (for each channel)
+    # TODO: move to utils, if other functions are added
+    def _nonlinear_energy_operator(self, signal: np.ndarray, ll=0, p=0, q=1, s=-1):
+        """general form of the nonlinear energy operator
+
+        return x(n-ll)x(n-p) - x(n-q)x(n-s)
         """
-        Returns the threshold for the spike detection given an array of signal.
+        assert (ll + p) == (q + s), "Incorrect parameters. Must be l+p=q+s"
 
-        Denoho D. et al., `link <https://web.stanford.edu/dept/statistics/cgi-bin/donoho/wp-content/uploads/2018/08/denoiserelease3.pdf>`_.
-        Spike sorting step by step, `step 2 <http://www.scholarpedia.org/article/Spike_sorting>`_.
+        y = np.zeros_like(signal, dtype=np.float_)
 
-        Parameters
-        ----------
-        signal : np.array
-            The signal as a 1-dimensional numpy array
-        cutoff : float
-            The spike-cutoff multiplier. (default=5.0)
-        """
-        noise_mid = np.median(np.absolute(signal)) / 0.6745
-        spike_threshold = -cutoff * noise_mid
-        return spike_threshold
+        N = signal.shape[0]  # TODO: Axis could be changed
+        n_edge = abs(ll) + abs(p) + abs(q) + abs(s)
+        idx = np.arange(n_edge + 1, (N - n_edge - 1))
 
-    def _detect_threshold_crossings(
-        self, signal: SignalType, fs: float, threshold: float, dead_time: float
-    ):
-        """
-        Detect threshold crossings in a signal with dead time and return them as an array
-
-        The signal transitions from a sample above the threshold to a sample below the threshold for a detection and
-        the last detection has to be more than dead_time apart from the current one.
-
-        Parameters
-        ----------
-        signal : SignalType
-            The signal as a 1-dimensional numpy array
-        fs : float
-            The sampling frequency in Hz
-        threshold : float
-            The threshold for the signal
-        dead_time : float
-            The dead time in seconds.
-        """
-        dead_time_idx = dead_time * fs
-        threshold_crossings = np.diff((signal <= threshold).astype(int) > 0).nonzero()[
-            0
-        ]
-        distance_sufficient = np.insert(
-            np.diff(threshold_crossings) >= dead_time_idx, 0, True
+        # TODO: Axis could be changed
+        y[idx, :] = (
+            signal[idx - ll, :] * signal[idx - p, :]
+            - signal[idx - q, :] * signal[idx - s, :]
         )
-        while not np.all(distance_sufficient):
-            # repeatedly remove all threshold crossings that violate the dead_time
-            threshold_crossings = threshold_crossings[distance_sufficient]
-            distance_sufficient = np.insert(
-                np.diff(threshold_crossings) >= dead_time_idx, 0, True
-            )
-        return threshold_crossings
 
-    def _get_next_minimum(self, signal, index, max_samples_to_search):
-        """
-        Returns the index of the next minimum in the signal after an index
+        return y
 
-        :param signal: The signal as a 1-dimensional numpy array
-        :param index: The scalar index
-        :param max_samples_to_search: The number of samples to search for a minimum after the index
-        """
-        search_end_idx = min(index + max_samples_to_search, signal.shape[0])
-        min_idx = np.argmin(signal[index:search_end_idx])
-        return index + min_idx
+    def _signal_energy_operator(self, signal, absolute=False, variation="teager"):
+        """generate different NLEOs based on the same operator
 
-    def _align_to_minimum(self, signal, fs, threshold_crossings, search_range):
-        """
-        Returns the index of the next negative spike peak for all threshold crossings
+        Parameters
+        ----------
+        signal: np.ndarray
+            input signal
+        absolute: bool
+            if True, return absolute value of operator
+        variation: {'teager', 'agarwal', 'palmu'}
+            which type of NLEO?
 
-        :param signal: The signal as a 1-dimensional numpy array
-        :param fs: The sampling frequency in Hz
-        :param threshold_crossings: The array of indices where the signal crossed the detection threshold
-        :param search_range: The maximum duration in seconds to search for the minimum after each crossing
+        Returns
+        -------
+        output : ndarray
         """
-        search_end = int(search_range * fs)
-        aligned_spikes = [
-            self._get_next_minimum(signal, t, search_end) for t in threshold_crossings
-        ]
-        return np.array(aligned_spikes)
+
+        coeffs = {
+            "teager": [0, 0, 1, -1],
+            "agarwal": [1, 2, 0, 3],
+            "palmu": [1, 2, 0, 3],
+        }
+        output = self._nonlinear_energy_operator(signal, *coeffs[variation])
+        if absolute:
+            output.data = np.abs(output.data)
+        return output
 
     def plot_spiketrain(
         self,

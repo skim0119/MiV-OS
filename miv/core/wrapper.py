@@ -21,7 +21,7 @@ import inspect
 from collections import UserList
 from dataclasses import dataclass, make_dataclass
 
-from miv.core.datatype import DataTypes, Extendable
+from miv.core.datatype.protocol import Extendable
 from miv.core.operator.operator import Operator, OperatorMixin
 
 

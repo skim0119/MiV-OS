@@ -3,7 +3,7 @@ __doc__ = """
 Code Example::
 
     detection = ThresholdCutoff(cutoff=3.5)
-    spiketrains = detection(signal, timestamps, sampling_rate)
+    signal >> detection
 
 .. currentmodule:: miv.signal.spike
 
@@ -13,7 +13,7 @@ Code Example::
 
    SpikeDetectionProtocol
    ThresholdCutoff
-   SWTTEO
+   SWTTEODetection
    ExtractWaveforms
    WaveformAverage
    WaveformStatisticalFilter

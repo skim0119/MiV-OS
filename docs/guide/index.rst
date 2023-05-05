@@ -7,6 +7,7 @@ Here we provide number of example scripts using `MiV` tools. Some examples provi
    :maxdepth: 2
    :caption: Analysis
 
+   swtteo
    connectivity_network
    info_theory
    lyon_ear_model

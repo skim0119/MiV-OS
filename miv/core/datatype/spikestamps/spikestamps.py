@@ -12,13 +12,14 @@ __all__ = ["Spikestamps"]
 from typing import List, Optional
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import numpy as np
 import quantities as pq
 
 from miv.core.datatype.collapsable import CollapseExtendableMixin
 from miv.core.datatype.signal import Signal
-from miv.core.operator.operator import DataNodeMixin
+from miv.core.operator.operator import DataNodeMixin, OperatorMixin
 
 
 class Spikestamps(CollapseExtendableMixin, DataNodeMixin, Sequence):
